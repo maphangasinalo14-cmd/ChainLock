@@ -1,0 +1,81 @@
+# Kyverno ClusterPolicy for Image Verification
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-chainlock-images
+  annotations:
+    policies.kyverno.io/title: Verify ChainLock Signed Images
+    policies.kyverno.io/category: Software Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Verifies container images are signed with Cosign keyless signatures.
+spec:
+  validationFailureAction: Enforce
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+
+  rules:
+    - name: verify-image-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:s
+                - production
+                - staging
+
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/YOUR_USERNAME/*"
+
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/YOUR_USERNAME/{{REPO_NAME}}/.github/workflows/*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+
+          attestations:
+            - predicateType: https://spdx.dev/Document
+              attestors:
+                - entries:
+                    - keyless:
+                        subject: "https://github.com/YOUR_USERNAME/{{REPO_NAME}}/.github/workflows/*"
+                        issuer: "https://token.actions.githubusercontent.com"
+                        rekor:
+                          url: https://rekor.sigstore.dev
+
+          mutateDigest: true
+          verifyDigest: true
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-sbom-attestation
+spec:
+  validationFailureAction: Enforce
+  background: false
+
+  rules:
+    - name: check-sbom-exists
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - production
+
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/YOUR_USERNAME/*"
+
+          attestations:
+            - predicateType: https://spdx.dev/Document
+              attestors:
+                - entries:
+                    - keyless:
+                        subject: "https://github.com/YOUR_USERNAME/*"
+                        issuer: "https://token.actions.githubusercontent.com"

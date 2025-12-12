@@ -1,0 +1,39 @@
+# ClusterImagePolicy for Sigstore Policy Controller
+# Enforces signature verification at deployment time in Kubernetes
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: chainlock-verified-images
+  annotations:
+    description: "Enforce signature verification for all container images"
+spec:
+  images:
+    - glob: "ghcr.io/YOUR_USERNAME/**"
+
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuerRegExp: ".*"
+            subjectRegExp: "https://github.com/YOUR_USERNAME/.*"
+        rekor:
+          url: https://rekor.sigstore.dev
+        ctlog:
+          url: https://ctfe.sigstore.dev
+
+  mode: enforce
+
+  attestations:
+    - name: sbom-attestation
+      predicateType: https://spdx.dev/Document
+      policy:
+        type: cue
+        data: |
+          predicateType: "https://spdx.dev/Document"
+
+    - name: vulnerability-scan
+      predicateType: https://cosign.sigstore.dev/attestation/vuln/v1
+      policy:
+        type: cue
+        data: |
+          predicateType: "https://cosign.sigstore.dev/attestation/vuln/v1"

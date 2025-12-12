@@ -1,0 +1,259 @@
+name: ChainLock Secure Build & Sign
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+    tags: [ "v*.*.*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    name: Security & Vulnerability Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (Filesystem)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Run Grype vulnerability scanner
+        uses: anchore/scan-action@v3
+        id: grype-scan
+        with:
+          path: "."
+          fail-build: false
+
+  build-sign-attest:
+    name: Build, Sign & Attest
+    runs-on: ubuntu-latest
+    needs: security-scan
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    outputs:
+      image-digest: ${{ steps.build-and-push.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Install Syft (SBOM Generator)
+        uses: anchore/sbom-action/download-syft@v0.17.2
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and Push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: 📝 Generate SBOM with Syft
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          echo "Generating SBOM for: $IMAGE_REF"
+
+          syft "$IMAGE_REF" -o spdx-json=sbom.spdx.json
+          syft "$IMAGE_REF" -o cyclonedx-json=sbom.cyclonedx.json
+          syft "$IMAGE_REF" -o syft-json=sbom.syft.json
+
+          echo "::notice::Generated SBOM in SPDX, CycloneDX, and Syft formats"
+
+      - name: 🔍 Scan Container Image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: 🔐 Sign Container Image with Cosign (Keyless)
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          echo "Signing image: $IMAGE_REF"
+          cosign sign --yes "$IMAGE_REF"
+          echo "::notice::Image signed with Sigstore keyless signing"
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+      - name: 📎 Attach SBOM to Image
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          cosign attach sbom --sbom sbom.spdx.json "$IMAGE_REF"
+          echo "::notice::SBOM attached to container image"
+
+      - name: 📋 Attest SBOM with Cosign
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          cosign attest --yes --predicate sbom.spdx.json --type spdxjson "$IMAGE_REF"
+          echo "::notice::SBOM attestation created"
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+      - name: 🔒 Attest Vulnerability Scan with Cosign
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          cosign attest --yes --predicate trivy-results.json --type vuln "$IMAGE_REF"
+          echo "::notice::Vulnerability scan attestation created"
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+      - name: 📦 Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-artifacts
+          path: |
+            sbom.*.json
+            trivy-results.json
+          retention-days: 90
+
+      - name: Generate Build Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔒 ChainLock Build Summary
+
+          ### Container Image
+          - **Digest:** `${{ steps.build-and-push.outputs.digest }}`
+          - **Tags:**
+          $(echo "${{ steps.meta.outputs.tags }}" | sed 's/^/  - /')
+
+          ### Security Attestations
+          - ✅ Image signed with Sigstore (keyless)
+          - ✅ SBOM generated (SPDX, CycloneDX, Syft)
+          - ✅ SBOM attached and attested
+          - ✅ Vulnerability scan completed and attested
+          - ✅ Multi-architecture build (amd64, arm64)
+
+          ### Verification Command
+          ```bash
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}
+          ```
+          EOF
+
+  verify:
+    name: Verify Signatures & Attestations
+    runs-on: ubuntu-latest
+    needs: build-sign-attest
+    permissions:
+      packages: read
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 Verify Image Signature
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-sign-attest.outputs.image-digest }}"
+          echo "Verifying signature for: $IMAGE_REF"
+
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF"
+
+          echo "::notice::✅ Signature verification successful!"
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+      - name: 🔍 Verify SBOM Attestation
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-sign-attest.outputs.image-digest }}"
+          echo "Verifying SBOM attestation..."
+
+          cosign verify-attestation \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --type spdxjson \
+            "$IMAGE_REF"
+
+          echo "::notice::✅ SBOM attestation verified!"
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+      - name: Generate Verification Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ Verification Complete
+
+          All cryptographic signatures and attestations verified:
+          - ✅ Image signature verified
+          - ✅ SBOM attestation verified
+          - ✅ Supply chain integrity confirmed
+
+          **Image is ready for production deployment**
+          EOF
